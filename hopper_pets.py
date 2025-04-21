@@ -28,12 +28,13 @@ def collect_data(num_episodes=100, max_steps=200):
             if terminated or truncated:
                 break
         
-        trajectories.append({
-            'states': np.array(states),
-            'actions': np.array(actions),
-            'next_states': np.array(next_states),
-            'rewards': np.array(rewards)
-        })
+        if len(states) > 8:
+            trajectories.append({
+                'states': np.array(states),
+                'actions': np.array(actions),
+                'next_states': np.array(next_states),
+                'rewards': np.array(rewards)
+            })
     
     env.close()
     return trajectories
@@ -54,23 +55,23 @@ def is_healthy(observation, exclude_current_positions_from_observation=True):
     
     return state_healthy and z_healthy and angle_healthy
 
-class StatePredictor(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=128): # 128
-        super(StatePredictor, self).__init__()
+class ModelMember(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super(ModelMember, self).__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.SiLU(),
-            # nn.Linear(hidden_dim, hidden_dim),
-            # nn.SiLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, state_dim)
         )
         
-    def forward(self, state, action, n_euler_steps=4): # 4
+    def forward(self, state, action, n_euler_steps=1):
         state_action = torch.cat([state, action], dim=-1)
         next_state = state
         step_size = 1.0 / n_euler_steps
@@ -79,85 +80,25 @@ class StatePredictor(nn.Module):
             state_action = torch.cat([next_state, action], dim=-1)
         return next_state
 
-# class StatePredictor(nn.Module):
-#     def __init__(self, state_dim, action_dim, hidden_dim=128, ensemble_size=5):
-#         super(StatePredictor, self).__init__()
-#         self.models = nn.ModuleList([
-#             StatePredictorMini(state_dim, action_dim, hidden_dim) 
-#             for _ in range(ensemble_size)
-#         ])
+class StatePredictor(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=128, ensemble_size=5):
+        super(StatePredictor, self).__init__()
+        self.ensemble_size = ensemble_size
+        self.models = nn.ModuleList([
+            ModelMember(state_dim, action_dim, hidden_dim) 
+            for _ in range(ensemble_size)
+        ])
         
-#     def forward(self, state, action, n_euler_steps=4):
-#         predictions = [model(state, action, n_euler_steps) for model in self.models]
-#         return torch.mean(torch.stack(predictions), dim=0)
-
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-# # Jump ODE
-# class StatePredictor(nn.Module):
-#     def __init__(self, state_dim, action_dim, hidden_dim=128):
-#         super(StatePredictor, self).__init__()
-#         self.state_dim = state_dim
-#         self.action_dim = action_dim
+    def forward(self, state, action, n_euler_steps=1, model_idx=None):
+        if model_idx is not None:
+            return self.models[model_idx](state, action, n_euler_steps)
         
-#         # Continuous dynamics network (similar to original)
-#         self.dynamics_net = nn.Sequential(
-#             nn.Linear(state_dim + action_dim, hidden_dim),
-#             nn.Tanh(),
-#             nn.Linear(hidden_dim, hidden_dim),
-#             nn.Tanh(),
-#             nn.Linear(hidden_dim, state_dim)
-#         )
-        
-#         # Jump probability network
-#         self.jump_prob_net = nn.Sequential(
-#             nn.Linear(state_dim + action_dim, hidden_dim),
-#             nn.Tanh(),
-#             nn.Linear(hidden_dim, 1),
-#             nn.Sigmoid()  # Output probability of jumping
-#         )
-        
-#         # Jump target network (predicts where to jump to)
-#         self.jump_target_net = nn.Sequential(
-#             nn.Linear(state_dim + action_dim, hidden_dim),
-#             nn.Tanh(),
-#             nn.Linear(hidden_dim, state_dim)
-#         )
-        
-#     def continuous_dynamics(self, state, action):
-#         """Compute the continuous state derivative"""
-#         state_action = torch.cat([state, action], dim=-1)
-#         return self.dynamics_net(state_action)
+        predictions = [model(state, action, n_euler_steps) for model in self.models]
+        return torch.stack(predictions, dim=0)
     
-#     def jump_probability(self, state, action):
-#         """Compute the probability of jumping at this state"""
-#         state_action = torch.cat([state, action], dim=-1)
-#         return self.jump_prob_net(state_action)
-    
-#     def jump_target(self, state, action):
-#         """Compute the target state if a jump occurs"""
-#         state_action = torch.cat([state, action], dim=-1)
-#         return self.jump_target_net(state_action)
-    
-#     def forward(self, state, action, n_euler_steps=4, jump_threshold=0.5):
-#         next_state = state
-#         step_size = 1.0 / n_euler_steps
-        
-#         for step in range(n_euler_steps):
-#             jump_prob = self.jump_probability(next_state, action)
-#             should_jump = jump_prob > jump_threshold
-#             if should_jump.any():
-#                 jump_target = self.jump_target(next_state, action)
-#                 mask = should_jump.float() #.unsqueeze(-1)
-#                 dynamics = self.continuous_dynamics(next_state, action)
-#                 next_state = mask * jump_target + (1 - mask) * (next_state + step_size * dynamics)
-#             else:
-#                 # If no jumps, apply standard Euler step
-#                 dynamics = self.continuous_dynamics(next_state, action)
-#                 next_state = next_state + step_size * dynamics
-
-#         return next_state
+    def predict_mean(self, state, action, n_euler_steps=1):
+        predictions = self.forward(state, action, n_euler_steps)
+        return torch.mean(predictions, dim=0)
 
 def prepare_training_data(trajectories, batch_size=32):
     state_samples = []
@@ -193,24 +134,42 @@ def train_model(data_loader, state_dim, action_dim, epochs=50, lr=5e-4, model=No
     else:
         dynamics_model = StatePredictor(state_dim, action_dim)
     
-    dynamics_optimizer = torch.optim.Adam(dynamics_model.parameters(), lr=lr, weight_decay=1e-4)
-    dynamics_criterion = nn.MSELoss()
+    ensemble_size = dynamics_model.ensemble_size
+    
+    optimizers = [torch.optim.Adam(model.parameters(), lr=lr) for model in dynamics_model.models]
+    criterion = nn.MSELoss()
     
     for epoch in range(epochs):
-        total_dynamics_loss = 0.0
+        total_dynamics_losses = [0.0 for _ in range(ensemble_size)]
         num_batches = 0
         
         for states, actions, next_states, _ in data_loader:
-            dynamics_optimizer.zero_grad()
-            predicted_next_states = dynamics_model(states, actions)
-            dynamics_loss = dynamics_criterion(predicted_next_states, next_states)
-            dynamics_loss.backward()
-            dynamics_optimizer.step()
+            batch_size = states.shape[0]
             
-            total_dynamics_loss += dynamics_loss.item()
+            for model_idx, (model, optimizer) in enumerate(zip(dynamics_model.models, optimizers)):
+                mask = torch.zeros(batch_size, dtype=torch.bool)
+                indices = torch.randperm(batch_size)[:batch_size // 2]
+                mask[indices] = True
+                
+                if not any(mask):
+                    continue
+                
+                optimizer.zero_grad()
+                batch_states = states[mask]
+                batch_actions = actions[mask]
+                batch_next_states = next_states[mask]
+                
+                predicted_next_states = model(batch_states, batch_actions)
+                dynamics_loss = criterion(predicted_next_states, batch_next_states)
+                dynamics_loss.backward()
+                optimizer.step()
+                
+                total_dynamics_losses[model_idx] += dynamics_loss.item()
+            
             num_batches += 1
         
-        print(f"Epoch {epoch+1}/{epochs}, Dynamics Loss: {total_dynamics_loss/num_batches:.6f}")
+        avg_losses = [loss/num_batches for loss in total_dynamics_losses]
+        print(f"Epoch {epoch+1}/{epochs}, Dynamics Losses: {avg_losses}")
     
     return dynamics_model
 
@@ -221,7 +180,7 @@ def simulate_model(dynamics_model, reward_model, init_state, action_sequence):
     
     for action in action_sequence:
         action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
-        next_state = dynamics_model(states[-1], action_tensor)
+        next_state = dynamics_model.predict_mean(states[-1], action_tensor)
         
         reward = reward_model(states[-1], action_tensor, next_state)
         
@@ -258,30 +217,37 @@ def optimize_actions(dynamics_model, init_state, horizon=30, iterations=10, lr=1
     for i in range(iterations):
         optimizer.zero_grad()
         
-        current_state = init_state_tensor.clone()
-        states = [current_state]
-        terminated = False
-        for t in range(horizon):
-            action = torch.tanh(actions[t]).unsqueeze(0)
-            next_state = dynamics_model(current_state, action)
-            states.append(next_state)
+        total_loss = 0
+        for model_idx in range(dynamics_model.ensemble_size):
+            current_state = init_state_tensor.clone()
+            states = [current_state]
             
-            current_state = next_state
-        trajectory = torch.cat(states, dim=0)
-        x_velocities = trajectory[:, 5]
-        angles = trajectory[:, 1]
-        z = trajectory[:, 0]
-        total_loss = -torch.mean(torch.tanh((z - 0.7) * 10)) + -torch.mean(torch.tanh((0.2 - torch.abs(angles)) * 10)) -x_velocities.mean()
-
-
+            for t in range(horizon):
+                action = torch.tanh(actions[t]).unsqueeze(0)
+                next_state = dynamics_model(current_state, action, model_idx=model_idx)
+                states.append(next_state)
+                current_state = next_state
+            
+            trajectory = torch.cat(states, dim=0)
+            x_velocities = trajectory[:, 5]
+            angles = trajectory[:, 1]
+            z = trajectory[:, 0]
+            velocity_losses = -x_velocities
+            angle_losses = 200 * angles**2
+            
+            discount_factors = torch.tensor([gamma**t for t in range(len(velocity_losses))], 
+                                          dtype=torch.float32)
+            
+            discounted_velocity_loss = torch.mean(velocity_losses * discount_factors)
+            discounted_angle_loss = torch.mean(angle_losses * discount_factors)
+            
+            model_loss = discounted_velocity_loss /10 + discounted_angle_loss
+            # model_loss = discounted_angle_loss
+            model_loss = -torch.mean(torch.tanh((z - 0.7) * 10)) + -torch.mean(torch.tanh((0.2 - torch.abs(angles)) * 10))
+            total_loss += model_loss / dynamics_model.ensemble_size
 
         total_loss.backward()
         optimizer.step()
-        
-        # if (i+1) % 1 == 0:
-        #     with torch.no_grad():
-        #         print(f"Iteration {i+1}/{iterations}, Loss: {total_loss:.4f}, " 
-        #               f"Vel: {velocity_loss:.4f}, Action: {action_loss}, health: {health_loss}")
     
     with torch.no_grad():
         final_actions = torch.tanh(actions)
@@ -385,13 +351,17 @@ def main():
     best_dynamics_model = None
     best_performance = -float('inf')
     
-    num_iterations = 200
-    dynamics_model = None
+    num_iterations = 2000
+    # dynamics_model = None
     for iteration in range(num_iterations):
         print(f"\n===== ITERATION {iteration+1}/{num_iterations} =====")
         
         data_loader = prepare_training_data(all_trajectories, batch_size=64)
-        dynamics_model = train_model(data_loader, state_dim, action_dim, epochs=20, lr=1e-3, model=None)
+        
+        # if dynamics_model is None:
+        #     dynamics_model = StatePredictor(state_dim, action_dim, ensemble_size=5)
+        
+        dynamics_model = train_model(data_loader, state_dim, action_dim, epochs=20, lr=1e-3)
         
         print(f"Iteration {iteration+1}: Model training complete")
         
@@ -399,15 +369,14 @@ def main():
         optimized_trajectories = collect_optimized_trajectories(
             dynamics_model, 
             num_episodes=1, 
-            horizon=30, # 30
-            iterations=50, # 50
-            lr=0.001 #0.01
+            horizon=5, #20
+            iterations=50,
+            lr=0.001
         )
         
         print(f"Iteration {iteration+1}: Collected {len(optimized_trajectories)} optimized trajectories")
         
-        # print(f"Iteration {iteration+1}: Evaluating current model")
-        # current_performance = eval_model(dynamics_model, n_evals=3)
+        #current_performance = eval_model(dynamics_model, n_evals=3)
         
         # if current_performance > best_performance:
         #     best_performance = current_performance

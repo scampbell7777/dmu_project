@@ -10,10 +10,12 @@ import copy
 def collect_data(num_episodes=100, max_steps=200):
     env = gym.make('InvertedPendulum-v4')
     trajectories = []
+    total_steps = 0
     
     while len(trajectories) < num_episodes:
         state, _ = env.reset()
         states, actions, next_states = [], [], []
+        episode_steps = 0
         
         for t in range(max_steps):
             action = env.action_space.sample()
@@ -24,18 +26,19 @@ def collect_data(num_episodes=100, max_steps=200):
             next_states.append(next_state)
             
             state = next_state
+            episode_steps += 1
             if terminated or truncated:
                 break
         
+        total_steps += episode_steps
         trajectories.append({
             'states': np.array(states),
             'actions': np.array(actions),
             'next_states': np.array(next_states)})
     
     env.close()
-    return trajectories
+    return trajectories, total_steps
 
-# Network to learn dynamics i.e. the model
 class StatePredictor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=64):
         super(StatePredictor, self).__init__()
@@ -44,17 +47,14 @@ class StatePredictor(nn.Module):
         
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.Tanh(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, state_dim)
         )
         
     def forward(self, state, action, n_euler_steps=4):
-        # Concatenate state and action
         state_action = torch.cat([state, action], dim=-1)
-        # If n_steps is greater than 1, this is basically Euler's method
-        # for integrating a neural ODE
         next_state = state
         step_size = 1.0 / n_euler_steps
         for _ in range(n_euler_steps):
@@ -62,7 +62,6 @@ class StatePredictor(nn.Module):
             state_action = torch.cat([next_state, action], dim=-1)
         return next_state
 
-# Process trajectories into batched training data for the dynamics model.
 def prepare_training_data(trajectories, batch_size=32):
     state_samples = []
     action_samples = []
@@ -89,7 +88,7 @@ def prepare_training_data(trajectories, batch_size=32):
 
 def train_model(data_loader, state_dim, action_dim, epochs=50, lr=5e-4):
     model = StatePredictor(state_dim, action_dim)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.MSELoss()
     
     for epoch in range(epochs):
@@ -110,21 +109,9 @@ def train_model(data_loader, state_dim, action_dim, epochs=50, lr=5e-4):
     
     return model
 
-def simulate_model(model, init_state, action_sequence):
-    init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
-    states = [init_state_tensor]
-    
-    for action in action_sequence:
-        action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
-        next_state = model(states[-1], action_tensor)
-        states.append(next_state)
-    
-    return torch.stack(states).squeeze(1)
-
 def optimize_actions(model, init_state, horizon=10, iterations=100, lr=1e-4):
     init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
     actions = nn.Parameter(torch.randn(horizon, 1) * 0.1)
-    # Only actions are optimized. Not the dynamics model.
     optimizer = torch.optim.Adam([actions], lr=lr)
     
     for i in range(iterations):
@@ -132,40 +119,38 @@ def optimize_actions(model, init_state, horizon=10, iterations=100, lr=1e-4):
         
         current_state = init_state_tensor.clone()
         total_angle_cost = 0.0
-        # Discount future states because our dynamics model will accrue larger errors in later timesteps.
         discount = 1.0
         for t in range(horizon):
-            # Clamp actions in a differentiable way
             action = torch.tanh(actions[t]) * 3.0
-            action = action.unsqueeze(0)  # Add batch dimension
-            next_state = model(current_state, action) # n_euler_steps=8
+            action = action.unsqueeze(0)
+            next_state = model(current_state, action)
             angle = next_state[0, 1]
             angle_cost = angle ** 2
-            total_angle_cost*=discount
+            total_angle_cost *= discount
             total_angle_cost += angle_cost
             current_state = next_state.detach().clone()
         
         total_angle_cost.backward()
         optimizer.step()
-        
-        # if (i+1) % 5 == 0:
-        #     print(f"Iteration {i+1}/{iterations}, Cost: {total_angle_cost.item():.6f}")
     
     with torch.no_grad():
         final_actions = torch.tanh(actions) * 3.0
     
     return final_actions
 
-def eval_gradient_actions(model, horizon=10, iterations=100, lr=0.1, n_evals=100):
-    print(f"Evaluating gradient-based action optimization: horizon={horizon}, iterations={iterations}")
+def eval_model(model, horizon=10, iterations=100, lr=0.1, n_evals=10, max_steps=1000):
     env = gym.make('InvertedPendulum-v4')
-    avg_reward = 0
+    rewards = []
+    trajectories = []
+    total_steps = 0
     
     for k in range(n_evals):
         state, _ = env.reset()
         total_reward = 0
+        states, actions, next_states = [], [], []
+        episode_steps = 0
         
-        for step in range(1000):
+        for step in range(max_steps):
             action_seq = optimize_actions(
                 model, 
                 state, 
@@ -174,38 +159,92 @@ def eval_gradient_actions(model, horizon=10, iterations=100, lr=0.1, n_evals=100
                 lr=lr
             )
             
-            # Take the first action from the sequence
             action = action_seq[0].detach().numpy()
             next_state, reward, terminated, truncated, _ = env.step([action.item()])
+            
+            states.append(state)
+            actions.append([action.item()])
+            next_states.append(next_state)
+            
             state = next_state
             total_reward += reward
-            print(total_reward)
+            episode_steps += 1
+            
             if terminated or truncated:
                 break
         
-        avg_reward += total_reward
-        print(f"Episode {k+1}: Reward = {total_reward:.2f}")
+        total_steps += episode_steps
+        rewards.append(total_reward)
+        trajectories.append({
+            'states': np.array(states),
+            'actions': np.array(actions),
+            'next_states': np.array(next_states)})
+        
+        print(f"Episode {k+1}: Reward = {total_reward:.2f}, Steps = {episode_steps}")
     
-    print(f"Average reward over {n_evals} episodes: {avg_reward / n_evals:.2f}")
+    avg_reward = np.mean(rewards)
+    std_reward = np.std(rewards)
+    print(f"Average reward: {avg_reward:.2f} ± {std_reward:.2f}")
+    
     env.close()
+    return avg_reward, std_reward, trajectories, total_steps
 
 def main():
-    # 1) Collect initial data from random actions
-    trajectories = collect_data(num_episodes=1000)
-    print(f"Collected {len(trajectories)} random trajectories")
+    max_iterations = 20
+    all_trajectories = []
+    all_data_points = []
+    total_env_steps = 0
     
-    traj_sample = trajectories[0]
+    initial_trajectories, steps = collect_data(num_episodes=10)
+    all_trajectories.extend(initial_trajectories)
+    total_env_steps += steps
+    print(f"Collected {len(initial_trajectories)} random trajectories, Total steps: {total_env_steps}")
+    
+    traj_sample = all_trajectories[0]
     state_dim = traj_sample['states'].shape[1]
     action_dim = traj_sample['actions'].shape[1]
     
-    # Train initial model
-    data_loader = prepare_training_data(trajectories, batch_size=64)
-    model = train_model(data_loader, state_dim, action_dim, epochs=100, lr=1e-3)
-    print("Initial model training complete")
+    for iteration in range(max_iterations):
+        print(f"\nIteration {iteration+1}/{max_iterations}")
+        
+        data_loader = prepare_training_data(all_trajectories, batch_size=64)
+        model = train_model(data_loader, state_dim, action_dim, epochs=10, lr=1e-3)
+        
+        avg_reward, std_reward, new_trajectories, eval_steps = eval_model(
+            model, horizon=10, iterations=50, lr=1e-2, n_evals=1
+        )
+        # avg_reward, std_reward, _, _ = eval_model(
+        #     model, horizon=10, iterations=50, lr=1e-2, n_evals=1
+        # )
+        
+        all_trajectories.extend(new_trajectories)
+        
+        all_data_points.append({
+            'total_steps': total_env_steps,
+            'avg_reward': avg_reward,
+            'std_reward': std_reward
+        })
+        total_env_steps += eval_steps
+        if avg_reward == 1000:
+            break
+        
+        print(f"Total environment steps: {total_env_steps}")
     
-    # Evaluate gradient-based action optimization
-    print("Gradient-based action optimization evaluation:")
-    eval_gradient_actions(model, horizon=10, iterations=50, lr=1e-2, n_evals=10)
+    plot_results(all_data_points)
+
+def plot_results(data_points):
+    steps = [point['total_steps'] for point in data_points]
+    rewards = [point['avg_reward'] for point in data_points]
+    stds = [point['std_reward'] for point in data_points]
+    print(steps, rewards)
+    plt.figure(figsize=(10, 6))
+    plt.errorbar(steps, rewards, yerr=stds, marker='o', linestyle='-', capsize=5)
+    plt.xlabel('Total Environment Steps')
+    plt.ylabel('Average Reward')
+    plt.title('Learning Progress: Reward vs. Environment Steps')
+    plt.grid(True)
+    plt.savefig('learning_progress.png')
+    plt.show()
 
 if __name__ == "__main__":
     main()
