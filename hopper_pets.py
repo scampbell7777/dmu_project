@@ -19,7 +19,7 @@ def collect_data(num_episodes=100, max_steps=200):
         
         for t in range(max_steps):
             action = env.action_space.sample()
-            action = np.zeros_like(action)
+            #action = np.zeros_like(action)
             next_state, reward, terminated, truncated, info = env.step(action)
             
             states.append(state)
