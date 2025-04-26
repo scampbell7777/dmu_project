@@ -7,20 +7,21 @@ from torch.utils.data import DataLoader, TensorDataset
 import random
 import copy
 
-def collect_data(num_episodes=100, max_steps=200):
-    env = gym.make('Ant-v5')
+def collect_data(num_episodes=100, max_steps=1000):
+    env = gym.make('Ant-v5', reset_noise_scale=0.5)
     trajectories = []
     total_steps = 0
-    
+    total_rewards = []
     while len(trajectories) < num_episodes:
         state, _ = env.reset()
         states, actions, next_states = [], [], []
         episode_steps = 0
-        
+        total_reward = 0
         for t in range(max_steps):
             action = env.action_space.sample()
-            next_state, _, terminated, truncated, _ = env.step(action)
-            
+            # action = np.zeros_like(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
             states.append(state)
             actions.append(action)
             next_states.append(next_state)
@@ -31,11 +32,14 @@ def collect_data(num_episodes=100, max_steps=200):
                 break
         
         total_steps += episode_steps
+        print(total_reward, " ", episode_steps)
+        total_rewards.append(total_reward)
         trajectories.append({
             'states': np.array(states),
             'actions': np.array(actions),
             'next_states': np.array(next_states)})
-    
+        
+    print("Average reward: ", np.mean(total_rewards), " ", np.std(total_rewards))
     env.close()
     return trajectories, total_steps
 
@@ -53,7 +57,7 @@ class StatePredictor(nn.Module):
             nn.Linear(hidden_dim, state_dim)
         )
         
-    def forward(self, state, action, n_euler_steps=4):
+    def forward(self, state, action, n_euler_steps=1):
         state_action = torch.cat([state, action], dim=-1)
         next_state = state
         step_size = 1.0 / n_euler_steps
@@ -86,6 +90,8 @@ def prepare_training_data(trajectories, batch_size=32):
     
     return data_loader
 
+
+
 def train_model(data_loader, state_dim, action_dim, epochs=50, lr=5e-4):
     model = StatePredictor(state_dim, action_dim)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -111,9 +117,10 @@ def train_model(data_loader, state_dim, action_dim, epochs=50, lr=5e-4):
 
 def optimize_actions(model, init_state, horizon=10, iterations=100, lr=1e-4):
     init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
-    actions = nn.Parameter(torch.randn(horizon, 8) * 0.1)  # Ant has 8 action dimensions
+    actions = nn.Parameter(torch.randn(horizon, 8)*0.2)  # Ant has 8 action dimensions
     optimizer = torch.optim.Adam([actions], lr=lr)
-    
+    #return torch.zeros_like(actions)
+    #print(torch.tanh(actions))
     for i in range(iterations):
         optimizer.zero_grad()
         
@@ -133,24 +140,27 @@ def optimize_actions(model, init_state, horizon=10, iterations=100, lr=1e-4):
             
             # Barrier function for z-position to keep ant healthy (z is at index 0)
             z_pos = next_state[0, 0] # was 2
-            height_penalty = torch.max(torch.tensor(0.0), 0.2 - z_pos) * 10.0 + torch.max(torch.tensor(0.0), z_pos - 1.0) * 10.0
+            # height_penalty = torch.max(torch.tensor(0.0), 0.2 - z_pos) * 10.0 + torch.max(torch.tensor(0.0), z_pos - 1.0) * 10.0
             
-            # Combine rewards (negative because we're minimizing)
-            step_cost = -forward_reward + height_penalty
+            # # Combine rewards (negative because we're minimizing)
+            # step_cost = -forward_reward + height_penalty + 0.5 * torch.sum(action**2)
+            is_healthy = torch.tanh((z_pos - 0.2) * 40) * torch.tanh((1.0 - z_pos) * 40)
+            step_cost = 0*-is_healthy.mean() - (x_vel*is_healthy).mean() #+ 0.5 * torch.sum(action**2)
             
             total_cost += gamma * step_cost
             gamma *= discount
             current_state = next_state
-        
+        # print(actions)
+        # print(next_state)
         total_cost.backward()
         optimizer.step()
-    
+    # print(model(init_state_tensor, torch.tanh(actions[0]).unsqueeze(0)))
     with torch.no_grad():
         final_actions = torch.tanh(actions) * 1.0
-    
+    # print('-------')
     return final_actions
 
-def eval_model(model, horizon=10, iterations=100, lr=0.1, n_evals=10, max_steps=1000):
+def eval_model(model, horizon=10, iterations=100, lr=0.1, n_evals=10, max_steps=200):
     env = gym.make('Ant-v5', render_mode="rgb_array")
     rewards = []
     trajectories = []
@@ -172,7 +182,14 @@ def eval_model(model, horizon=10, iterations=100, lr=0.1, n_evals=10, max_steps=
             )
             
             action = action_seq[0].detach().numpy()
-            next_state, reward, terminated, truncated, _ = env.step(action)
+            #print(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
+            model_next_state = model(torch.tensor(state, dtype=torch.float32).unsqueeze(0), torch.tensor(action, dtype=torch.float32).unsqueeze(0)).detach().numpy()
+            # print(step, " ", total_reward, " ", info)
+            # print(model_next_state)
+            # print(next_state)
+            # print(next_state[13] , " ", model_next_state[0][13])
+            # print("--------")
             
             states.append(state)
             actions.append(action)
@@ -183,8 +200,9 @@ def eval_model(model, horizon=10, iterations=100, lr=0.1, n_evals=10, max_steps=
             episode_steps += 1
             
             if terminated or truncated:
+                print(info)
                 break
-        
+            
         total_steps += episode_steps
         rewards.append(total_reward)
         trajectories.append({
@@ -207,7 +225,7 @@ def main():
     all_data_points = []
     total_env_steps = 0
     
-    initial_trajectories, steps = collect_data(num_episodes=10)
+    initial_trajectories, steps = collect_data(num_episodes=1000)
     all_trajectories.extend(initial_trajectories)
     total_env_steps += steps
     print(f"Collected {len(initial_trajectories)} random trajectories, Total steps: {total_env_steps}")
@@ -218,12 +236,12 @@ def main():
     
     for iteration in range(max_iterations):
         print(f"\nIteration {iteration+1}/{max_iterations}")
-        
+        n_steps = 30 # int(np.sqrt(iteration)) * 20
+        print(n_steps)
         data_loader = prepare_training_data(all_trajectories, batch_size=64)
-        model = train_model(data_loader, state_dim, action_dim, epochs=10, lr=1e-3)
-        
+        model = train_model(data_loader, state_dim, action_dim, epochs=30, lr=1e-3)
         avg_reward, std_reward, new_trajectories, eval_steps = eval_model(
-            model, horizon=10, iterations=50, lr=1e-2, n_evals=1
+            model, horizon=15, iterations=50, lr=1e-3, n_evals=1, max_steps=n_steps
         )
         
         all_trajectories.extend(new_trajectories)

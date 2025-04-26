@@ -1,3 +1,5 @@
+
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,6 +19,7 @@ def collect_data(num_episodes=100, max_steps=200):
         
         for t in range(max_steps):
             action = env.action_space.sample()
+            action = np.zeros_like(action)
             next_state, reward, terminated, truncated, info = env.step(action)
             
             states.append(state)
@@ -28,13 +31,13 @@ def collect_data(num_episodes=100, max_steps=200):
             if terminated or truncated:
                 break
         
-        if len(states) > 8:
-            trajectories.append({
-                'states': np.array(states),
-                'actions': np.array(actions),
-                'next_states': np.array(next_states),
-                'rewards': np.array(rewards)
-            })
+        trajectories.append({
+            'states': np.array(states),
+            'actions': np.array(actions),
+            'next_states': np.array(next_states),
+            'rewards': np.array(rewards)
+        })
+        print(f"Episode {len(trajectories)}: collected trajectory with {len(states)} steps and reward {sum(rewards)}")
     
     env.close()
     return trajectories
@@ -63,11 +66,11 @@ class ModelMember(nn.Module):
         
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.Tanh(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, state_dim)
         )
         
@@ -81,7 +84,7 @@ class ModelMember(nn.Module):
         return next_state
 
 class StatePredictor(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=128, ensemble_size=5):
+    def __init__(self, state_dim, action_dim, hidden_dim=128, ensemble_size=3):
         super(StatePredictor, self).__init__()
         self.ensemble_size = ensemble_size
         self.models = nn.ModuleList([
@@ -136,7 +139,7 @@ def train_model(data_loader, state_dim, action_dim, epochs=50, lr=5e-4, model=No
     
     ensemble_size = dynamics_model.ensemble_size
     
-    optimizers = [torch.optim.Adam(model.parameters(), lr=lr) for model in dynamics_model.models]
+    optimizers = [torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4) for model in dynamics_model.models]
     criterion = nn.MSELoss()
     
     for epoch in range(epochs):
@@ -173,46 +176,12 @@ def train_model(data_loader, state_dim, action_dim, epochs=50, lr=5e-4, model=No
     
     return dynamics_model
 
-def simulate_model(dynamics_model, reward_model, init_state, action_sequence):
-    init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
-    states = [init_state_tensor]
-    rewards = []
-    
-    for action in action_sequence:
-        action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
-        next_state = dynamics_model.predict_mean(states[-1], action_tensor)
-        
-        reward = reward_model(states[-1], action_tensor, next_state)
-        
-        states.append(next_state)
-        rewards.append(reward)
-    
-    return torch.stack(states).squeeze(1), torch.stack(rewards).squeeze(1)
-
-def check_termination(state_tensor, exclude_current_positions_from_observation=True):
-    healthy_state_range = [-100.0, 100.0]
-    healthy_z_range = [0.7, float('inf')]
-    healthy_angle_range = [-0.2, 0.2]
-    
-    if exclude_current_positions_from_observation:
-        z_healthy = healthy_z_range[0] <= state_tensor[0].item() <= healthy_z_range[1]
-        angle_healthy = healthy_angle_range[0] <= state_tensor[1].item() <= healthy_angle_range[1]
-        state_healthy = all(healthy_state_range[0] <= x.item() <= healthy_state_range[1] 
-                            for x in state_tensor[1:])
-    else:
-        z_healthy = healthy_z_range[0] <= state_tensor[1].item() <= healthy_z_range[1]
-        angle_healthy = healthy_angle_range[0] <= state_tensor[2].item() <= healthy_angle_range[1]
-        state_healthy = all(healthy_state_range[0] <= x.item() <= healthy_state_range[1] 
-                            for x in state_tensor[2:])
-    
-    return not (z_healthy and angle_healthy and state_healthy)
-
 def optimize_actions(dynamics_model, init_state, horizon=30, iterations=10, lr=1e-1, gamma=1.0):
     init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
     
-    actions = nn.Parameter(torch.randn(horizon, 3) * 0.1)
-    
-    optimizer = torch.optim.Adam([actions], lr=lr)
+    actions = nn.Parameter(torch.randn(horizon, 3) * 0.01)
+    # actions = nn.Parameter(torch.rand(horizon, 3) * 2 - 1)
+    optimizer = torch.optim.Adam([actions], lr=lr, weight_decay=1e-5)
     
     for i in range(iterations):
         optimizer.zero_grad()
@@ -232,25 +201,20 @@ def optimize_actions(dynamics_model, init_state, horizon=30, iterations=10, lr=1
             x_velocities = trajectory[:, 5]
             angles = trajectory[:, 1]
             z = trajectory[:, 0]
-            velocity_losses = -x_velocities
-            angle_losses = 200 * angles**2
-            
-            discount_factors = torch.tensor([gamma**t for t in range(len(velocity_losses))], 
-                                          dtype=torch.float32)
-            
-            discounted_velocity_loss = torch.mean(velocity_losses * discount_factors)
-            discounted_angle_loss = torch.mean(angle_losses * discount_factors)
-            
-            model_loss = discounted_velocity_loss /10 + discounted_angle_loss
-            # model_loss = discounted_angle_loss
-            model_loss = -torch.mean(torch.tanh((z - 0.7) * 10)) + -torch.mean(torch.tanh((0.2 - torch.abs(angles)) * 10))
-            total_loss += model_loss / dynamics_model.ensemble_size
+            is_healthy = torch.tanh((z - 0.7) * 40) * torch.tanh((0.2 - torch.abs(angles)) * 40)
 
+            # model_loss = -torch.mean(torch.tanh((z - 0.7) * 10)) -torch.mean(torch.tanh((0.2 - torch.abs(angles)) * 10)) - (x_velocities*is_healthy).mean()
+            model_loss = -is_healthy.mean() - (x_velocities*is_healthy).mean()
+            total_loss += model_loss / dynamics_model.ensemble_size
         total_loss.backward()
         optimizer.step()
     
     with torch.no_grad():
         final_actions = torch.tanh(actions)
+        
+        #print(final_actions)
+        # final_actions = actions
+        # final_actions = torch.zeros_like(final_actions)
     
     return final_actions
 
@@ -275,7 +239,7 @@ def collect_optimized_trajectories(dynamics_model, num_episodes=10, horizon=30, 
             )
             
             action = action_seq[0].detach().numpy()
-            next_state, reward, terminated, truncated, _ = env.step(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
             total_reward+=reward
             
             states.append(state)
@@ -287,14 +251,14 @@ def collect_optimized_trajectories(dynamics_model, num_episodes=10, horizon=30, 
             steps += 1
             done = terminated or truncated
         
-        if len(states) > 8:
-            trajectories.append({
-                'states': np.array(states),
-                'actions': np.array(actions),
-                'next_states': np.array(next_states),
-                'rewards': np.array(rewards)
-            })
-            print(f"Episode {episode+1}: collected trajectory with {len(states)} steps and reward {total_reward}")
+        trajectories.append({
+            'states': np.array(states),
+            'actions': np.array(actions),
+            'next_states': np.array(next_states),
+            'rewards': np.array(rewards)
+        })
+        print(info)
+        print(f"Episode {episode+1}: collected trajectory with {len(states)} steps and reward {total_reward}")
     
     env.close()
     return trajectories
@@ -337,7 +301,7 @@ def eval_model(dynamics_model, n_evals=5):
     return avg_reward/n_evals
 
 def main():
-    random_trajectories = collect_data(num_episodes=100, max_steps=1000)
+    random_trajectories = collect_data(num_episodes=20, max_steps=1000)
     print(f"Collected {len(random_trajectories)} random trajectories")
     
     traj_sample = random_trajectories[0]
@@ -348,48 +312,56 @@ def main():
     
     all_trajectories = random_trajectories.copy()
     
-    best_dynamics_model = None
-    best_performance = -float('inf')
-    
-    num_iterations = 2000
+    num_iterations = 20
     # dynamics_model = None
+    total_steps = 0
+    steps_history = []
+    rewards_history = []
+    
     for iteration in range(num_iterations):
-        print(f"\n===== ITERATION {iteration+1}/{num_iterations} =====")
+        print(f"\n===== ITERATION {iteration+1}/{num_iterations} (Total Steps: {total_steps}) =====")
         
         data_loader = prepare_training_data(all_trajectories, batch_size=64)
+    
         
-        # if dynamics_model is None:
-        #     dynamics_model = StatePredictor(state_dim, action_dim, ensemble_size=5)
-        
-        dynamics_model = train_model(data_loader, state_dim, action_dim, epochs=20, lr=1e-3)
+        dynamics_model = train_model(data_loader, state_dim, action_dim, epochs=40, lr=1e-3)
         
         print(f"Iteration {iteration+1}: Model training complete")
-        
+        horizon = 10
+        print(horizon)
         print(f"Iteration {iteration+1}: Collecting optimized trajectories")
         optimized_trajectories = collect_optimized_trajectories(
             dynamics_model, 
             num_episodes=1, 
-            horizon=5, #20
+            horizon=horizon, #20
             iterations=50,
             lr=0.001
         )
         
+        # Update total steps and record history
+        iteration_reward = 0
+        for traj in optimized_trajectories:
+            total_steps += len(traj['states'])
+            iteration_reward += np.sum(traj['rewards'])
+        
+        avg_reward = iteration_reward / len(optimized_trajectories) if optimized_trajectories else 0
+        steps_history.append(total_steps)
+        rewards_history.append(avg_reward)
+        
         print(f"Iteration {iteration+1}: Collected {len(optimized_trajectories)} optimized trajectories")
-        
-        #current_performance = eval_model(dynamics_model, n_evals=3)
-        
-        # if current_performance > best_performance:
-        #     best_performance = current_performance
-        #     best_dynamics_model = copy.deepcopy(dynamics_model)
-        #     print(f"Iteration {iteration+1}: New best model! Performance: {best_performance:.2f}")
         
         all_trajectories.extend(optimized_trajectories)
         print(f"Iteration {iteration+1}: Total trajectories: {len(all_trajectories)}")
-    
-    print("\n===== FINAL EVALUATION =====")
-    print("Evaluating best model:")
-    final_performance = eval_model(best_dynamics_model, n_evals=5)
-    print(f"Best model performance: {final_performance:.2f}")
+    plt.figure(figsize=(10, 6))
+    plt.plot(steps_history, rewards_history, 'b-o', linewidth=2, markersize=4)
+    plt.xlabel('Total Steps')
+    plt.ylabel('Average Reward')
+    plt.title('Learning Curve: Steps vs Average Reward')
+    plt.grid(True)
+    plt.savefig('learning_curve.png')
+    plt.show()
+    print([steps_history, rewards_history])
 
 if __name__ == "__main__":
     main()
+

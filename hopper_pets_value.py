@@ -284,7 +284,7 @@ def check_termination(state_tensor, exclude_current_positions_from_observation=T
 def optimize_actions(dynamics_model, value_network, rtg_mean, rtg_std, init_state, horizon=30, iterations=10, lr=1e-1, gamma=0.95):
     init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
     
-    actions = nn.Parameter(torch.randn(horizon, 3) * 0.1)
+    actions = nn.Parameter(torch.randn(horizon, 3) * 0.01)
     
     optimizer = torch.optim.Adam([actions], lr=lr)
     
@@ -306,13 +306,15 @@ def optimize_actions(dynamics_model, value_network, rtg_mean, rtg_std, init_stat
             x_velocities = trajectory[:, 5]
             angles = trajectory[:, 1]
             z = trajectory[:, 0]
-            model_loss = -torch.mean(torch.tanh((z - 0.7) * 10)) + -torch.mean(torch.tanh((0.2 - torch.abs(angles)) * 10)) -x_velocities.mean()
+            #model_loss = -torch.mean(torch.tanh((z - 0.7) * 10)) + -torch.mean(torch.tanh((0.2 - torch.abs(angles)) * 10)) -x_velocities.mean()
             
+            is_healthy = torch.tanh((z - 0.7) * 40) * torch.tanh((0.2 - torch.abs(angles)) * 40)
+            model_loss = -is_healthy.mean() - (x_velocities*is_healthy).mean()
             final_state = states[-1]
             if value_network is not None:
                 final_value = value_network(final_state) * rtg_std + rtg_mean
                 final_value = final_value * (gamma ** horizon)
-                #total_loss+=-final_value/dynamics_model.ensemble_size
+                # total_loss+=-final_value/dynamics_model.ensemble_size
                 total_loss += (model_loss - final_value) / dynamics_model.ensemble_size
             else:
                 final_value = 0
@@ -447,8 +449,8 @@ def main():
         None,
         0,
         1,
-        num_episodes=50, 
-        horizon=20,
+        num_episodes=20, 
+        horizon=10,
         iterations=20,
         lr=0.001
     )
@@ -462,8 +464,8 @@ def main():
             rtg_mean,
             rtg_std,
             num_episodes=50, 
-            horizon=5,
-            iterations=20,
+            horizon=1,
+            iterations=30,
             lr=0.001
         )
     value_data_loader, rtg_mean, rtg_std = prepare_value_data(optimized_trajectories, gamma=0.99, batch_size=64)

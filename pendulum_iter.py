@@ -189,7 +189,7 @@ def eval_model(model, horizon=10, iterations=100, lr=0.1, n_evals=10, max_steps=
     env.close()
     return avg_reward, std_reward, trajectories, total_steps
 
-def main():
+def solve():
     max_iterations = 20
     all_trajectories = []
     all_data_points = []
@@ -211,11 +211,8 @@ def main():
         model = train_model(data_loader, state_dim, action_dim, epochs=10, lr=1e-3)
         
         avg_reward, std_reward, new_trajectories, eval_steps = eval_model(
-            model, horizon=10, iterations=50, lr=1e-2, n_evals=1
+            model, horizon=1, iterations=50, lr=1e-2, n_evals=1
         )
-        # avg_reward, std_reward, _, _ = eval_model(
-        #     model, horizon=10, iterations=50, lr=1e-2, n_evals=1
-        # )
         
         all_trajectories.extend(new_trajectories)
         
@@ -230,21 +227,30 @@ def main():
         
         print(f"Total environment steps: {total_env_steps}")
     
-    plot_results(all_data_points)
+    return plot_results(all_data_points)
+
+def main():
+    print("staring")
+    res = []
+    for i in range(50): 
+        res.append(solve())
+    print(res)
+    print("done")
 
 def plot_results(data_points):
     steps = [point['total_steps'] for point in data_points]
     rewards = [point['avg_reward'] for point in data_points]
     stds = [point['std_reward'] for point in data_points]
-    print(steps, rewards)
-    plt.figure(figsize=(10, 6))
-    plt.errorbar(steps, rewards, yerr=stds, marker='o', linestyle='-', capsize=5)
-    plt.xlabel('Total Environment Steps')
-    plt.ylabel('Average Reward')
-    plt.title('Learning Progress: Reward vs. Environment Steps')
-    plt.grid(True)
-    plt.savefig('learning_progress.png')
-    plt.show()
+    return [steps, rewards]
+    # print(steps, rewards)
+    # plt.figure(figsize=(10, 6))
+    # plt.errorbar(steps, rewards, yerr=stds, marker='o', linestyle='-', capsize=5)
+    # plt.xlabel('Total Environment Steps')
+    # plt.ylabel('Average Reward')
+    # plt.title('Learning Progress: Reward vs. Environment Steps')
+    # plt.grid(True)
+    # plt.savefig('learning_progress.png')
+    # plt.show()
 
 if __name__ == "__main__":
     main()

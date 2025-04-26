@@ -18,65 +18,42 @@ class TrainingMetricsCallback(BaseCallback):
     def _on_step(self):
         # Track rewards
         self.episode_reward += self.locals["rewards"][0]
-        
+        if self.episode_reward  == 1000:
+            return False
         # If episode ended
         if self.locals["dones"][0]:
             self.num_episodes += 1
             self.episode_rewards.append(self.episode_reward)
             self.timesteps.append(self.num_timesteps)
             self.episode_reward = 0
-            
-            # Plot every 10 episodes
-            if self.num_episodes % 10 == 0:
-                self._plot_training_progress()
-                
         return True
     
-    def _plot_training_progress(self):
-        plt.figure(figsize=(12, 5))
-        
-        # Plot episode rewards
-        plt.subplot(1, 2, 1)
-        plt.plot(range(len(self.episode_rewards)), self.episode_rewards)
-        plt.xlabel('Episodes')
-        plt.ylabel('Episode Reward')
-        plt.title('Reward per Episode')
-        
-        # Plot timesteps
-        plt.subplot(1, 2, 2)
-        plt.plot(range(len(self.episode_rewards)), self.timesteps)
-        plt.xlabel('Episodes')
-        plt.ylabel('Timesteps')
-        plt.title('Timesteps per Episode')
-        
-        plt.tight_layout()
-        plt.savefig(f'training_progress_{self.num_episodes}.png')
-        plt.close()
+res = []
+for i in range(10):
+    env = gym.make("InvertedPendulum-v4")  # Specify render_mode here
+    eval_env = gym.make("InvertedPendulum-v4")
 
-# Create environment
-env = gym.make("InvertedPendulum-v4")  # Specify render_mode here
-eval_env = gym.make("InvertedPendulum-v4")
+    # Initialize the model
+    model = PPO(
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=3e-4,
+        n_steps=512,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        verbose=1
+    )
 
-# Initialize the model
-model = PPO(
-    policy="MlpPolicy",
-    env=env,
-    learning_rate=3e-4,
-    n_steps=512,
-    batch_size=64,
-    n_epochs=10,
-    gamma=0.99,
-    gae_lambda=0.95,
-    clip_range=0.2,
-    verbose=1
-)
-
-# Create the callback
-callback = TrainingMetricsCallback()
-# Train the model with callback
-model.learn(total_timesteps=50000, callback=callback)
-print(callback.timesteps), print(callback.episode_rewards)
-
+    # Create the callback
+    callback = TrainingMetricsCallback()
+    # Train the model with callback
+    model.learn(total_timesteps=50000, callback=callback)
+    print(callback.timesteps), print(callback.episode_rewards)
+    res.append([callback.timesteps, callback.episode_rewards])
+print(res)
 
 # # Plot episode rewards
 plt.subplot(1, 2, 1)
