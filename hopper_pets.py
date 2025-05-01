@@ -440,15 +440,15 @@ def main():
             lr=0.001,
             method='gradient'
         )
-        print("cem")
-        collect_optimized_trajectories(
-            dynamics_model, 
-            num_episodes=1, 
-            horizon=1   , #20
-            iterations=3000,
-            lr=0.001,
-            method='cem'
-        )
+        # print("cem")
+        # collect_optimized_trajectories(
+        #     dynamics_model, 
+        #     num_episodes=1, 
+        #     horizon=1   , #20
+        #     iterations=3000,
+        #     lr=0.001,
+        #     method='cem'
+        # )
         
         # Update total steps and record history
         iteration_reward = 0
