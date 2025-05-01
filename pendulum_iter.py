@@ -138,7 +138,32 @@ def optimize_actions(model, init_state, horizon=10, iterations=100, lr=1e-4):
     
     return final_actions
 
-def eval_model(model, horizon=10, iterations=100, lr=0.1, n_evals=10, max_steps=1000):
+def optimize_actions_random_shooting(model, init_state, horizon=10, num_samples=1000):
+    init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
+    action_samples = torch.randn(num_samples, horizon, 1) * 0.1
+    action_samples = torch.tanh(action_samples) * 3.0
+    costs = torch.zeros(num_samples)
+    
+    for s in range(num_samples):
+        current_state = init_state_tensor.clone()
+        total_angle_cost = 0.0
+        discount = 1.0
+        
+        for t in range(horizon):
+            action = action_samples[s, t].unsqueeze(0)
+            next_state = model(current_state, action)
+            angle = next_state[0, 1]
+            angle_cost = angle ** 2
+            total_angle_cost *= discount
+            total_angle_cost += angle_cost
+            current_state = next_state
+        
+        costs[s] = total_angle_cost
+    
+    best_idx = torch.argmin(costs)
+    return action_samples[best_idx]
+
+def eval_model(model, horizon=10, iterations=100, lr=0.1, n_evals=10, max_steps=1000, method='gradient'):
     env = gym.make('InvertedPendulum-v4')
     rewards = []
     trajectories = []
@@ -151,13 +176,21 @@ def eval_model(model, horizon=10, iterations=100, lr=0.1, n_evals=10, max_steps=
         episode_steps = 0
         
         for step in range(max_steps):
-            action_seq = optimize_actions(
-                model, 
-                state, 
-                horizon=horizon, 
-                iterations=iterations,
-                lr=lr
-            )
+            if method == 'gradient':
+                action_seq = optimize_actions(
+                    model, 
+                    state, 
+                    horizon=horizon, 
+                    iterations=iterations,
+                    lr=lr
+                )
+            elif method == 'random_shooting':
+                action_seq = optimize_actions_random_shooting(
+                    model, 
+                    state, 
+                    horizon=horizon, 
+                    num_samples=100
+                )
             
             action = action_seq[0].detach().numpy()
             next_state, reward, terminated, truncated, _ = env.step([action.item()])
@@ -211,7 +244,7 @@ def solve():
         model = train_model(data_loader, state_dim, action_dim, epochs=10, lr=1e-3)
         
         avg_reward, std_reward, new_trajectories, eval_steps = eval_model(
-            model, horizon=1, iterations=50, lr=1e-2, n_evals=1
+            model, horizon=1, iterations=20, lr=1e-2, n_evals=1, method='gradient'
         )
         
         all_trajectories.extend(new_trajectories)
@@ -226,6 +259,13 @@ def solve():
             break
         
         print(f"Total environment steps: {total_env_steps}")
+
+    eval_model(
+        model, horizon=1, iterations=20, lr=1e-2, n_evals=5, method='gradient'
+    )
+    eval_model(
+        model, horizon=1, iterations=20, lr=1e-2, n_evals=5, method='random_shooting'
+    )
     
     return plot_results(all_data_points)
 

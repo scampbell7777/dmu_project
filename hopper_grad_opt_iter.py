@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 import random
 import copy
+import pickle
+
 
 def collect_data(num_episodes=100, max_steps=200):
     env = gym.make('Hopper-v5')
@@ -37,22 +39,6 @@ def collect_data(num_episodes=100, max_steps=200):
     
     env.close()
     return trajectories
-
-def is_healthy(observation, exclude_current_positions_from_observation=True):
-    healthy_state_range = [-100.0, 100.0]
-    healthy_z_range = [0.7, float('inf')]
-    healthy_angle_range = [-0.2, 0.2]
-    
-    if exclude_current_positions_from_observation:
-        state_healthy = all(healthy_state_range[0] <= x <= healthy_state_range[1] for x in observation[1:])
-        z_healthy = healthy_z_range[0] <= observation[0] <= healthy_z_range[1]
-        angle_healthy = healthy_angle_range[0] <= observation[1] <= healthy_angle_range[1]
-    else:
-        state_healthy = all(healthy_state_range[0] <= x <= healthy_state_range[1] for x in observation[2:])
-        z_healthy = healthy_z_range[0] <= observation[1] <= healthy_z_range[1]
-        angle_healthy = healthy_angle_range[0] <= observation[2] <= healthy_angle_range[1]
-    
-    return state_healthy and z_healthy and angle_healthy
 
 class StatePredictor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=128): # 128
@@ -214,40 +200,6 @@ def train_model(data_loader, state_dim, action_dim, epochs=50, lr=5e-4, model=No
     
     return dynamics_model
 
-def simulate_model(dynamics_model, reward_model, init_state, action_sequence):
-    init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
-    states = [init_state_tensor]
-    rewards = []
-    
-    for action in action_sequence:
-        action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0)
-        next_state = dynamics_model(states[-1], action_tensor)
-        
-        reward = reward_model(states[-1], action_tensor, next_state)
-        
-        states.append(next_state)
-        rewards.append(reward)
-    
-    return torch.stack(states).squeeze(1), torch.stack(rewards).squeeze(1)
-
-def check_termination(state_tensor, exclude_current_positions_from_observation=True):
-    healthy_state_range = [-100.0, 100.0]
-    healthy_z_range = [0.7, float('inf')]
-    healthy_angle_range = [-0.2, 0.2]
-    
-    if exclude_current_positions_from_observation:
-        z_healthy = healthy_z_range[0] <= state_tensor[0].item() <= healthy_z_range[1]
-        angle_healthy = healthy_angle_range[0] <= state_tensor[1].item() <= healthy_angle_range[1]
-        state_healthy = all(healthy_state_range[0] <= x.item() <= healthy_state_range[1] 
-                            for x in state_tensor[1:])
-    else:
-        z_healthy = healthy_z_range[0] <= state_tensor[1].item() <= healthy_z_range[1]
-        angle_healthy = healthy_angle_range[0] <= state_tensor[2].item() <= healthy_angle_range[1]
-        state_healthy = all(healthy_state_range[0] <= x.item() <= healthy_state_range[1] 
-                            for x in state_tensor[2:])
-    
-    return not (z_healthy and angle_healthy and state_healthy)
-
 def optimize_actions(dynamics_model, init_state, horizon=30, iterations=10, lr=1e-1, gamma=1.0):
     init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
     
@@ -370,8 +322,19 @@ def eval_model(dynamics_model, n_evals=5):
     env.close()
     return avg_reward/n_evals
 
+def load_trajectories(load_path="trained_trajectories.pkl"):
+    with open(load_path, 'rb') as f:
+        trajectories = pickle.load(f)
+    return trajectories
+
 def main():
     random_trajectories = collect_data(num_episodes=100, max_steps=1000)
+    print(random_trajectories[0]["states"].shape)
+    random_trajectories = load_trajectories("../../../transformers/trained_trajectories.pkl")
+    print(random_trajectories[0]["states"].shape)
+    print(random_trajectories[0]["states"].shape)
+    print(random_trajectories[0]["actions"].shape)
+    # print(random_trajectories)
     print(f"Collected {len(random_trajectories)} random trajectories")
     
     traj_sample = random_trajectories[0]
@@ -385,13 +348,13 @@ def main():
     best_dynamics_model = None
     best_performance = -float('inf')
     
-    num_iterations = 200
+    num_iterations = 5
     dynamics_model = None
     for iteration in range(num_iterations):
         print(f"\n===== ITERATION {iteration+1}/{num_iterations} =====")
         
         data_loader = prepare_training_data(all_trajectories, batch_size=64)
-        dynamics_model = train_model(data_loader, state_dim, action_dim, epochs=20, lr=1e-3, model=None)
+        dynamics_model = train_model(data_loader, state_dim, action_dim, epochs=5, lr=1e-3, model=None)
         
         print(f"Iteration {iteration+1}: Model training complete")
         

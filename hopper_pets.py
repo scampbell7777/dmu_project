@@ -42,22 +42,6 @@ def collect_data(num_episodes=100, max_steps=200):
     env.close()
     return trajectories
 
-def is_healthy(observation, exclude_current_positions_from_observation=True):
-    healthy_state_range = [-100.0, 100.0]
-    healthy_z_range = [0.7, float('inf')]
-    healthy_angle_range = [-0.2, 0.2]
-    
-    if exclude_current_positions_from_observation:
-        state_healthy = all(healthy_state_range[0] <= x <= healthy_state_range[1] for x in observation[1:])
-        z_healthy = healthy_z_range[0] <= observation[0] <= healthy_z_range[1]
-        angle_healthy = healthy_angle_range[0] <= observation[1] <= healthy_angle_range[1]
-    else:
-        state_healthy = all(healthy_state_range[0] <= x <= healthy_state_range[1] for x in observation[2:])
-        z_healthy = healthy_z_range[0] <= observation[1] <= healthy_z_range[1]
-        angle_healthy = healthy_angle_range[0] <= observation[2] <= healthy_angle_range[1]
-    
-    return state_healthy and z_healthy and angle_healthy
-
 class ModelMember(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=128):
         super(ModelMember, self).__init__()
@@ -66,11 +50,11 @@ class ModelMember(nn.Module):
         
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.SiLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, state_dim)
         )
         
@@ -203,7 +187,6 @@ def optimize_actions(dynamics_model, init_state, horizon=30, iterations=10, lr=1
             z = trajectory[:, 0]
             is_healthy = torch.tanh((z - 0.7) * 40) * torch.tanh((0.2 - torch.abs(angles)) * 40)
 
-            # model_loss = -torch.mean(torch.tanh((z - 0.7) * 10)) -torch.mean(torch.tanh((0.2 - torch.abs(angles)) * 10)) - (x_velocities*is_healthy).mean()
             model_loss = -is_healthy.mean() - (x_velocities*is_healthy).mean()
             total_loss += model_loss / dynamics_model.ensemble_size
         total_loss.backward()
@@ -211,14 +194,119 @@ def optimize_actions(dynamics_model, init_state, horizon=30, iterations=10, lr=1
     
     with torch.no_grad():
         final_actions = torch.tanh(actions)
-        
-        #print(final_actions)
-        # final_actions = actions
-        # final_actions = torch.zeros_like(final_actions)
     
     return final_actions
 
-def collect_optimized_trajectories(dynamics_model, num_episodes=10, horizon=30, iterations=50, lr=0.01):
+def optimize_actions_cem(dynamics_model, init_state, horizon=30, iterations=5, 
+                        population_size=500, elite_fraction=0.1, alpha=0.1):
+    init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
+    num_elites = int(population_size * elite_fraction)
+    
+    # Initialize mean and std for sampling
+    mu = torch.zeros(horizon, 3)
+    sigma = torch.ones(horizon, 3)
+    
+    best_actions = None
+    best_reward = float('-inf')
+    
+    for i in range(iterations):
+        # Sample actions from current distribution
+        action_samples = torch.randn(population_size, horizon, 3) * sigma.unsqueeze(0) + mu.unsqueeze(0)
+        action_samples = torch.clamp(action_samples, -1, 1)  # Constrain to [-1, 1]
+        rewards = torch.zeros(population_size)
+        
+        # Evaluate all sampled action sequences
+        for s in range(population_size):
+            total_reward = 0
+            
+            for model_idx in range(dynamics_model.ensemble_size):
+                current_state = init_state_tensor.clone()
+                reward_sum = 0
+                valid_trajectory = True
+                
+                for t in range(horizon):
+                    action = action_samples[s, t].unsqueeze(0)
+                    next_state = dynamics_model(current_state, action, model_idx=model_idx)
+                    
+                    angle = next_state[0, 1]
+                    z = next_state[0, 0]
+                    x_velocity = next_state[0, 5]
+                    
+                    # if abs(angle) < 0.2 or z < 0.7:
+                    #     valid_trajectory = False
+                    #     break
+                    
+                    step_reward = 1 + 0.08 * x_velocity
+                    reward_sum += step_reward
+                    current_state = next_state
+                
+                if not valid_trajectory:
+                    total_reward += -1 / dynamics_model.ensemble_size
+                else:
+                    total_reward += reward_sum / dynamics_model.ensemble_size
+            
+            rewards[s] = total_reward
+            
+            # Track best solution found across all iterations
+            if rewards[s] > best_reward:
+                best_reward = rewards[s]
+                best_actions = action_samples[s].clone()
+        
+        # Select elite samples
+        elite_idxs = torch.topk(rewards, num_elites).indices
+        elite_samples = action_samples[elite_idxs]
+        
+        # Update distribution parameters
+        new_mu = elite_samples.mean(dim=0)
+        new_sigma = elite_samples.std(dim=0)
+        
+        # Smooth update
+        mu = alpha * new_mu + (1 - alpha) * mu
+        sigma = alpha * new_sigma + (1 - alpha) * sigma
+    
+    return best_actions
+
+def optimize_actions_random_shooting(dynamics_model, init_state, horizon=30, num_samples=1000):
+    init_state_tensor = torch.tensor(init_state, dtype=torch.float32).unsqueeze(0)
+    action_samples = torch.rand(num_samples, horizon, 3) * 2 - 1  # Uniform between -1 and 1
+    rewards = torch.zeros(num_samples)
+    
+    for s in range(num_samples):
+        total_reward = 0
+        valid_trajectory = True
+        
+        for model_idx in range(dynamics_model.ensemble_size):
+            current_state = init_state_tensor.clone()
+            reward_sum = 0
+            
+            for t in range(horizon):
+                action = action_samples[s, t].unsqueeze(0)
+                next_state = dynamics_model(current_state, action, model_idx=model_idx)
+                
+                angle = next_state[0, 1]
+                z = next_state[0, 0]
+                x_velocity = next_state[0, 5]
+                
+                if abs(angle) < 0.2 or z < 0.7:
+                    valid_trajectory = False
+                    break
+                
+                step_reward = 1 + 0.008 * x_velocity
+                reward_sum += step_reward
+                
+                current_state = next_state
+            
+            if not valid_trajectory:
+                total_reward += -1 / dynamics_model.ensemble_size
+            else:
+                total_reward += reward_sum / dynamics_model.ensemble_size
+        
+        rewards[s] = total_reward
+    
+    best_idx = torch.argmax(rewards)
+    return action_samples[best_idx]
+
+def collect_optimized_trajectories(dynamics_model, num_episodes=10, horizon=30, iterations=50, lr=0.01, method='gradient'):
     env = gym.make('Hopper-v5')
     trajectories = []
     
@@ -230,13 +318,27 @@ def collect_optimized_trajectories(dynamics_model, num_episodes=10, horizon=30, 
         steps = 0
         total_reward = 0
         while not done and steps < 1000:
-            action_seq = optimize_actions(
-                dynamics_model, 
-                state, 
-                horizon=horizon, 
-                iterations=iterations,
-                lr=lr
-            )
+            if method == 'gradient':
+                action_seq = optimize_actions(
+                    dynamics_model, 
+                    state, 
+                    horizon=horizon, 
+                    iterations=iterations,
+                    lr=lr
+                )
+            elif method == 'random_shooting':
+                action_seq = optimize_actions_random_shooting(
+                    dynamics_model, 
+                    state, 
+                    horizon=horizon, 
+                    num_samples=iterations
+                )
+            elif method == 'cem':
+                action_seq = optimize_actions_cem(
+                    dynamics_model, 
+                    state, 
+                    horizon=5, iterations=5, 
+                    population_size=1000, elite_fraction=0.1, alpha=0.0)
             
             action = action_seq[0].detach().numpy()
             next_state, reward, terminated, truncated, info = env.step(action)
@@ -283,7 +385,7 @@ def eval_model(dynamics_model, n_evals=5):
             )
             
             action = action_seq[0].detach().numpy()
-            next_state, reward, terminated, truncated, _ = env.step(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
             
             state = next_state
             total_reward += reward
@@ -291,7 +393,7 @@ def eval_model(dynamics_model, n_evals=5):
             
             if terminated or truncated:
                 break
-        
+        print(info)
         avg_reward += total_reward
         avg_steps += episode_steps
         print(f"Eval episode {k+1}: Steps = {episode_steps}, Reward = {total_reward:.2f}")
@@ -335,7 +437,17 @@ def main():
             num_episodes=1, 
             horizon=horizon, #20
             iterations=50,
-            lr=0.001
+            lr=0.001,
+            method='gradient'
+        )
+        print("cem")
+        collect_optimized_trajectories(
+            dynamics_model, 
+            num_episodes=1, 
+            horizon=1   , #20
+            iterations=3000,
+            lr=0.001,
+            method='cem'
         )
         
         # Update total steps and record history
